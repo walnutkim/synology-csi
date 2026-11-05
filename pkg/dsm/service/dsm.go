@@ -698,6 +698,14 @@ func (service *DsmService) ListVolumes() (infos []*models.K8sVolumeRespSpec) {
 }
 
 func (service *DsmService) GetVolume(volId string) *models.K8sVolumeRespSpec {
+	// Find the volume directly first; see volume_lookup.go.
+	if volume := service.findISCSIVolume(volId); volume != nil {
+		return volume
+	}
+	if volume := service.findShareVolume(volId); volume != nil {
+		return volume
+	}
+
 	volumes := service.ListVolumes()
 	for _, volume := range volumes {
 		if volume.VolumeId == volId {
