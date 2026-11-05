@@ -196,6 +196,14 @@ func (service *DsmService) createMappingTarget(dsm *webapi.DSM, spec *models.Cre
 		}
 	}
 
+	// A retried CreateVolume gets here again for a LUN it already mapped, and
+	// DSM maps it a second time under a new LUN number on the same target.
+	for _, mapping := range targetInfo.MappedLuns {
+		if mapping.LunUuid == lunUuid {
+			return targetInfo, nil
+		}
+	}
+
 	if err := dsm.LunMapTarget([]string{targetId}, lunUuid); err != nil {
 		return webapi.TargetInfo{}, status.Errorf(codes.Internal, fmt.Sprintf("Failed to map target [%s] to lun [%s], err: %v", spec.TargetName, lunUuid, err))
 	}
