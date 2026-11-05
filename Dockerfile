@@ -21,7 +21,7 @@ RUN env GOARCH=$(echo "$TARGETPLATFORM" | cut -f2 -d/) \
         make
 
 ############## Final stage ##############
-FROM alpine:latest
+FROM alpine:3.24
 LABEL maintainers="Synology Authors" \
       description="Synology CSI Plugin"
 
