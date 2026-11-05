@@ -40,6 +40,8 @@ type controllerServer struct {
 	Driver     *Driver
 	dsmService interfaces.IDsmService
 	Initiator  *initiatorDriver
+	// Volume names with a CreateVolume in progress.
+	creating *operationLocks
 }
 
 func getSizeByCapacityRange(capRange *csi.CapacityRange) (int64, error) {
@@ -211,6 +213,16 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		DevAttribs:       devAttribs,
 		Reclaim:          utils.StringToBoolean(params["enableSpaceReclamation"]),
 	}
+
+	// The external provisioner retries a CreateVolume that outlives its
+	// timeout while the first call is still running here, since the DSM calls
+	// below do not stop when the request is cancelled. Two calls for the same
+	// volume both find it missing and both map its LUN, so turn the retry
+	// away until the first call is done.
+	if !cs.creating.tryLock(volName) {
+		return nil, status.Errorf(codes.Aborted, "CreateVolume for volume [%s] is already in progress", volName)
+	}
+	defer cs.creating.unlock(volName)
 
 	// idempotency
 	// Note: an SMB PV may not be tested existed precisely because the share folder name was sliced from k8sVolumeName

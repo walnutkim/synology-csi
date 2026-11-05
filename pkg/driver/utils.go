@@ -47,6 +47,7 @@ func NewControllerServer(d *Driver) *controllerServer {
 	return &controllerServer{
 		Driver:     d,
 		dsmService: d.DsmService,
+		creating:   newOperationLocks(),
 	}
 }
 
