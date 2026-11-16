@@ -878,7 +878,8 @@ func (ns *nodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVo
 			fmt.Sprintf("Volume[%s] does not exist on the %s", volumeId, volumePath))
 	}
 
-	if k8sVolume.Protocol == utils.ProtocolSmb || k8sVolume.Protocol == utils.ProtocolNfs {
+	// An SMB share reports only the size DSM gave it.
+	if k8sVolume.Protocol == utils.ProtocolSmb {
 		return &csi.NodeGetVolumeStatsResponse{
 			Usage: []*csi.VolumeUsage{
 				&csi.VolumeUsage{
@@ -889,42 +890,47 @@ func (ns *nodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVo
 		}, nil
 	}
 
-	// If we are dealing with a LUN use statfs
+	// A LUN and an NFS share both answer statfs. An NFS share used to report
+	// only its size, so the kubelet published zero used and available bytes
+	// and no alert could tell that the share was filling up.
 	statfs := &unix.Statfs_t{}
 	err = unix.Statfs(volumePath, statfs)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get fs info on path %s: %v", req.VolumePath, err)
 	}
 
-	// Available is blocks available * fragment size
-	available := int64(statfs.Bavail) * int64(statfs.Bsize)
+	return &csi.NodeGetVolumeStatsResponse{Usage: usageFromStatfs(statfs)}, nil
+}
 
-	// Capacity is total block count * fragment size
-	capacity := int64(statfs.Blocks) * int64(statfs.Bsize)
+// usageFromStatfs turns a statfs result into the usage the kubelet publishes.
+// A share with a quota reports the quota as its total; a share without one
+// reports the storage pool it lives on. The inode entry is left out when the
+// filesystem counts no inodes, as an NFS share on btrfs does.
+func usageFromStatfs(statfs *unix.Statfs_t) []*csi.VolumeUsage {
+	blockSize := int64(statfs.Bsize)
+	blocks := int64(statfs.Blocks)
 
-	// Usage is block being used * fragment size (aka block size).
-	usage := (int64(statfs.Blocks) - int64(statfs.Bfree)) * int64(statfs.Bsize)
+	usage := []*csi.VolumeUsage{
+		{
+			Unit:      csi.VolumeUsage_BYTES,
+			Available: int64(statfs.Bavail) * blockSize,
+			Total:     blocks * blockSize,
+			Used:      (blocks - int64(statfs.Bfree)) * blockSize,
+		},
+	}
 
 	inodes := int64(statfs.Files)
-	inodesFree := int64(statfs.Ffree)
-	inodesUsed := inodes - inodesFree
+	if inodes > 0 {
+		inodesFree := int64(statfs.Ffree)
+		usage = append(usage, &csi.VolumeUsage{
+			Unit:      csi.VolumeUsage_INODES,
+			Available: inodesFree,
+			Total:     inodes,
+			Used:      inodes - inodesFree,
+		})
+	}
 
-	return &csi.NodeGetVolumeStatsResponse{
-		Usage: []*csi.VolumeUsage{
-			{
-				Unit:      csi.VolumeUsage_BYTES,
-				Available: available,
-				Total:     capacity,
-				Used:      usage,
-			},
-			{
-				Unit:      csi.VolumeUsage_INODES,
-				Available: inodesFree,
-				Total:     inodes,
-				Used:      inodesUsed,
-			},
-		},
-	}, nil
+	return usage
 }
 
 func (ns *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
