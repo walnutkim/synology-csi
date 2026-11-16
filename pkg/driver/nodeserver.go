@@ -415,12 +415,76 @@ func (ns *nodeServer) setNFSVolumePrivilege(sourcePath string, hostnames []strin
 		})
 	}
 
-	err = dsm.ShareNfsPrivilegeSave(priv)
+	err = saveNFSPrivilegeVerified(
+		func() error { return dsm.ShareNfsPrivilegeSave(priv) },
+		func() ([]webapi.PrivilegeRule, error) {
+			loaded, err := dsm.ShareNfsPrivilegeLoad(shareName)
+			return loaded.Rule, err
+		},
+		hostnames, nfsPrivilegeSaveAttempts, nfsPrivilegeSaveInterval)
 	if err != nil {
-		log.Printf("Failed to save share NFS privilege. Priv:%v. %v", priv, err)
+		log.Printf("Failed to save share NFS privilege. Share:%s. %v", shareName, err)
 		return err
 	}
 	return nil
+}
+
+const (
+	nfsPrivilegeSaveAttempts = 5
+	nfsPrivilegeSaveInterval = 2 * time.Second
+)
+
+// saveNFSPrivilegeVerified saves the NFS rules and reads them back, saving again
+// while a client is missing. DSM can answer a save with success without storing
+// the rules, which leaves the share unexported and every mount failing with
+// "No such file or directory".
+//
+// Only a failed save is an error. Rules that still read back incomplete after the
+// last attempt are logged and left to the mount to judge, so that a DSM which
+// reports clients in another form cannot block volumes that do mount.
+func saveNFSPrivilegeVerified(save func() error, load func() ([]webapi.PrivilegeRule, error), clients []string, attempts int, interval time.Duration) error {
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(interval)
+		}
+		if lastErr = save(); lastErr != nil {
+			continue
+		}
+		rules, err := load()
+		if err != nil {
+			log.Warnf("Failed to read back the NFS privilege (attempt %d/%d): %v", i+1, attempts, err)
+			continue
+		}
+		missing := missingNFSClients(rules, clients)
+		if len(missing) == 0 {
+			return nil
+		}
+		log.Warnf("DSM accepted the NFS privilege but did not store it, missing clients: %v (attempt %d/%d)", missing, i+1, attempts)
+	}
+	return lastErr
+}
+
+func missingNFSClients(rules []webapi.PrivilegeRule, clients []string) []string {
+	stored := make(map[string]bool, len(rules))
+	for _, rule := range rules {
+		stored[rule.Client] = true
+	}
+	var missing []string
+	for _, client := range clients {
+		if !stored[client] {
+			missing = append(missing, client)
+		}
+	}
+	return missing
+}
+
+func (ns *nodeServer) resetNFSVolumePrivilege(ctx context.Context, source string) error {
+	nodeIps, err := getNodeAddress(ctx, ns.Client)
+	if err != nil {
+		return err
+	}
+	return ns.setNFSVolumePrivilege(source, nodeIps, utils.AuthTypeReadWrite)
 }
 
 func (ns *nodeServer) setSMBVolumePermission(sourcePath string, userName string, authType utils.AuthType) error {
@@ -729,6 +793,16 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 		log.Debugf("NodePublishVolume: volumeId(%v) source(%s) targetPath(%s) mountflags(%v)", volumeId, source, targetPath, options)
 		err = ns.Mounter.Mount(source, targetPath, "nfs", options)
+		if err != nil {
+			// The rules are otherwise set only in NodeStageVolume, so an export that is
+			// missing now would stay missing for every kubelet retry of this publish.
+			log.Warnf("NodePublishVolume: mount %s failed, setting the NFS privilege again: %v", source, err)
+			if privErr := ns.resetNFSVolumePrivilege(ctx, req.VolumeContext["source"]); privErr != nil {
+				log.Errorf("NodePublishVolume: failed to set the NFS privilege again for %s: %v", source, privErr)
+			} else {
+				err = ns.Mounter.Mount(source, targetPath, "nfs", options)
+			}
+		}
 		if err != nil {
 			if os.IsPermission(err) {
 				return nil, status.Error(codes.PermissionDenied, err.Error())
